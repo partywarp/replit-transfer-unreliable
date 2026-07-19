@@ -55,16 +55,14 @@ async def sixseven() -> str:
 
 
 async def send_help(ws: WebSocket) -> None:
-    await ws.send_text(
-        "Accepted commands:\n"
-        "CONNECT <ip> <port>\n"
-        "CLOSE\n"
-        "ROB <amount>\n"
-        "START <filename> <total_chunks> <sha256>\n"
-        "DATA <sequence_number> <text>\n"
-        "STATUS\n"
-        "DONE"
-    )
+    await ws.send_text("Accepted commands:")
+    await ws.send_text("CONNECT <ip> <port>")
+    await ws.send_text("CLOSE")
+    await ws.send_text("ROB <amount>")
+    await ws.send_text("START <filename> <total_chunks> <sha256>")
+    await ws.send_text("DATA <sequence_number> <text>")
+    await ws.send_text("STATUS")
+    await ws.send_text("DONE")
 
 
 @app.websocket("/ws")
