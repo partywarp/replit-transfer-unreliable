@@ -10,15 +10,23 @@ from dataclasses import dataclass, field
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.responses import HTMLResponse
 
-
 app = FastAPI()
 
 NY_TIMES_ADDRESS = "10.0.0.7:21"
 
-# These values control the simulated unreliable network.
-DATA_DROP_RATE = 0.15
-ACK_DROP_RATE = 0.15
-MAX_ACK_DELAY = 0.35
+# The simulated network divides each DATA payload into 100-byte frames.
+# Every frame independently has a 20% chance of being lost.
+VIRTUAL_FRAME_BYTES = 100
+FRAME_LOSS_RATE = 0.20
+
+# These settings simulate transmission time and per-message overhead.
+BASE_DELAY_SECONDS = 0.02
+LINK_BYTES_PER_SECOND = 5_000.0
+JITTER_SECONDS = 0.01
+
+DATA_HEADER_BYTES = 20
+ACK_BYTES = 8
+
 
 online_hosts: dict[str, str] = {
     "10.0.0.1:20": "The Bank",
@@ -33,19 +41,22 @@ class Transfer:
     filename: str
     total_chunks: int
     expected_sha256: str
-    chunks: dict[int, str] = field(default_factory=dict)
-    duplicate_packets: int = 0
+    chunks: dict[int, str] = field(default_factory=dict[int, str])
+
     packet_attempts: int = 0
+    dropped_attempts: int = 0
+    duplicate_packets: int = 0
+    simulated_wire_bytes: int = 0
 
 
 @app.get("/")
 async def health() -> dict[str, object]:
     return {
-        "version": 2.0,
+        "version": 3.0,
         "secret_count": 4,
         "python_version": sys.version,
-        "data_drop_rate": DATA_DROP_RATE,
-        "ack_drop_rate": ACK_DROP_RATE,
+        "virtual_frame_bytes": VIRTUAL_FRAME_BYTES,
+        "frame_loss_rate": FRAME_LOSS_RATE,
     }
 
 
@@ -55,14 +66,18 @@ async def sixseven() -> str:
 
 
 async def send_help(ws: WebSocket) -> None:
-    await ws.send_text("Accepted commands:")
-    await ws.send_text("CONNECT <ip> <port>")
-    await ws.send_text("CLOSE")
-    await ws.send_text("ROB <amount>")
-    await ws.send_text("START <filename> <total_chunks> <sha256>")
-    await ws.send_text("DATA <sequence_number> <text>")
-    await ws.send_text("STATUS")
-    await ws.send_text("DONE")
+    for line in (
+        "Accepted commands:\n"
+        "CONNECT <ip> <port>\n"
+        "CLOSE\n"
+        "ROB <amount>\n"
+        "START <filename> <total_chunks> <sha256>\n"
+        "DATA <sequence_number> <text>\n"
+        "STATUS\n"
+        "DONE\n"
+        "HELP".splitlines()
+    ):
+        await ws.send_text(line)
 
 
 @app.websocket("/ws")
@@ -76,7 +91,7 @@ async def ws_endpoint(ws: WebSocket) -> None:
         while True:
             message = await ws.receive_text()
 
-            if not message.strip():
+            if not message:
                 await ws.send_text("Empty command.")
                 continue
 
@@ -107,8 +122,9 @@ async def ws_endpoint(ws: WebSocket) -> None:
                     await ws.send_text("You have no connection.")
                     continue
 
-                transfer = None
                 connection = None
+                transfer = None
+
                 await ws.send_text("Connection closed.")
 
             elif command == "ROB":
@@ -129,35 +145,31 @@ async def ws_endpoint(ws: WebSocket) -> None:
                     continue
 
                 if online_hosts[connection] == "The Bank":
-                    await ws.send_text(
-                        f"Stole ${amount:.2f} from {connection}"
-                    )
+                    await ws.send_text(f"Stole ${amount:.2f} from {connection}")
                     await ws.send_text("The police caught you!")
                     await ws.send_text("You were removed.")
+
                     connection = None
+                    transfer = None
                 else:
-                    await ws.send_text(
-                        "You cannot rob your current connection!"
-                    )
+                    await ws.send_text("You cannot rob your current connection!")
 
             elif command == "START":
                 parts = message.split()
 
                 if len(parts) != 4:
                     await ws.send_text(
-                        "Usage: START <filename> <total_chunks> <sha256>"
+                        "Usage: START " "<filename> <total_chunks> <sha256>"
                     )
                     continue
 
                 if connection != NY_TIMES_ADDRESS:
-                    await ws.send_text(
-                        "File transfers are only accepted by NY Times."
-                    )
+                    await ws.send_text("File transfers are only accepted by NY Times.")
                     continue
 
                 if transfer is not None:
                     await ws.send_text(
-                        "A transfer is already active. Use CLOSE to cancel it."
+                        "A transfer is already active. " "Use CLOSE to cancel it."
                     )
                     continue
 
@@ -166,28 +178,24 @@ async def ws_endpoint(ws: WebSocket) -> None:
                 try:
                     total_chunks = int(parts[2])
                 except ValueError:
-                    await ws.send_text(
-                        "The total chunk count must be an integer."
-                    )
+                    await ws.send_text("The total chunk count must be an integer.")
                     continue
 
                 if total_chunks < 1 or total_chunks > 10_000:
                     await ws.send_text(
-                        "The total chunk count must be between 1 and 10000."
+                        "The total chunk count must be " "between 1 and 10000."
                     )
                     continue
 
                 expected_sha256 = parts[3].lower()
 
-                if (
-                    len(expected_sha256) != 64
-                    or any(
-                        character not in "0123456789abcdef"
-                        for character in expected_sha256
-                    )
-                ):
+                valid_sha256 = len(expected_sha256) == 64 and all(
+                    character in "0123456789abcdef" for character in expected_sha256
+                )
+
+                if not valid_sha256:
                     await ws.send_text(
-                        "The SHA-256 value must contain 64 hexadecimal characters."
+                        "The SHA-256 value must contain " "64 hexadecimal characters."
                     )
                     continue
 
@@ -197,38 +205,34 @@ async def ws_endpoint(ws: WebSocket) -> None:
                     expected_sha256=expected_sha256,
                 )
 
-                await ws.send_text(
-                    f"READY {filename} {total_chunks}"
-                )
+                await ws.send_text(f"READY {filename} {total_chunks}")
 
             elif command == "DATA":
                 if connection != NY_TIMES_ADDRESS:
-                    await ws.send_text(
-                        "You must connect to NY Times first."
-                    )
+                    await ws.send_text("You must connect to NY Times first.")
                     continue
 
                 if transfer is None:
-                    await ws.send_text(
-                        "No transfer active. Use START first."
-                    )
+                    await ws.send_text("No transfer active. Use START first.")
                     continue
 
-                # maxsplit=2 preserves spaces and newlines inside the payload.
-                parts = message.split(" ", maxsplit=2)
+                # partition() preserves spaces and newlines in the payload.
+                _, separator, remainder = message.partition(" ")
 
-                if len(parts) != 3:
-                    await ws.send_text(
-                        "Usage: DATA <sequence_number> <text>"
-                    )
+                if not separator:
+                    await ws.send_text("Usage: DATA <sequence_number> <text>")
+                    continue
+
+                sequence_text, separator, payload = remainder.partition(" ")
+
+                if not separator:
+                    await ws.send_text("Usage: DATA <sequence_number> <text>")
                     continue
 
                 try:
-                    sequence = int(parts[1])
+                    sequence = int(sequence_text)
                 except ValueError:
-                    await ws.send_text(
-                        "The sequence number must be an integer."
-                    )
+                    await ws.send_text("The sequence number must be an integer.")
                     continue
 
                 if sequence < 0 or sequence >= transfer.total_chunks:
@@ -238,12 +242,38 @@ async def ws_endpoint(ws: WebSocket) -> None:
                     )
                     continue
 
-                payload = parts[2]
-                transfer.packet_attempts += 1
+                payload_bytes = payload.encode("utf-8")
 
-                # Simulate a packet disappearing before reaching the receiver.
-                # No reply is sent, so the client must time out and retransmit.
-                if random.random() < DATA_DROP_RATE:
+                frame_count = max(
+                    1,
+                    (len(payload_bytes) + VIRTUAL_FRAME_BYTES - 1)
+                    // VIRTUAL_FRAME_BYTES,
+                )
+
+                transfer.packet_attempts += 1
+                transfer.simulated_wire_bytes += len(payload_bytes) + DATA_HEADER_BYTES
+
+                transmission_delay = (
+                    BASE_DELAY_SECONDS
+                    + len(payload_bytes) / LINK_BYTES_PER_SECOND
+                    + random.uniform(
+                        0.0,
+                        JITTER_SECONDS,
+                    )
+                )
+
+                await asyncio.sleep(transmission_delay)
+
+                # The entire DATA chunk fails if any frame is lost.
+                frame_was_lost = any(
+                    random.random() < FRAME_LOSS_RATE for _ in range(frame_count)
+                )
+
+                if frame_was_lost:
+                    transfer.dropped_attempts += 1
+
+                    # No response is sent. The client must time out
+                    # and retransmit the complete chunk.
                     continue
 
                 if sequence in transfer.chunks:
@@ -251,14 +281,7 @@ async def ws_endpoint(ws: WebSocket) -> None:
                 else:
                     transfer.chunks[sequence] = payload
 
-                await asyncio.sleep(
-                    random.uniform(0.0, MAX_ACK_DELAY)
-                )
-
-                # Simulate an acknowledgement being lost.
-                # The chunk was stored, but the client never receives the ACK.
-                if random.random() < ACK_DROP_RATE:
-                    continue
+                transfer.simulated_wire_bytes += ACK_BYTES
 
                 await ws.send_text(f"ACK {sequence}")
 
@@ -267,27 +290,29 @@ async def ws_endpoint(ws: WebSocket) -> None:
                     await ws.send_text("No transfer active.")
                     continue
 
-                received = len(transfer.chunks)
-
                 missing = [
-                    str(sequence)
+                    sequence
                     for sequence in range(transfer.total_chunks)
                     if sequence not in transfer.chunks
                 ]
 
                 if missing:
-                    missing_text = ",".join(missing[:25])
+                    missing_text = ",".join(str(sequence) for sequence in missing[:25])
 
                     if len(missing) > 25:
                         missing_text += ",..."
 
                     await ws.send_text(
-                        f"RECEIVED {received}/{transfer.total_chunks} "
+                        f"RECEIVED "
+                        f"{len(transfer.chunks)}/"
+                        f"{transfer.total_chunks} "
                         f"MISSING {missing_text}"
                     )
                 else:
                     await ws.send_text(
-                        f"RECEIVED {received}/{transfer.total_chunks} "
+                        f"RECEIVED "
+                        f"{len(transfer.chunks)}/"
+                        f"{transfer.total_chunks} "
                         "MISSING none"
                     )
 
@@ -303,16 +328,13 @@ async def ws_endpoint(ws: WebSocket) -> None:
                 ]
 
                 if missing:
-                    missing_text = ",".join(
-                        str(sequence)
-                        for sequence in missing[:25]
-                    )
+                    missing_text = ",".join(str(sequence) for sequence in missing[:25])
 
                     if len(missing) > 25:
                         missing_text += ",..."
 
                     await ws.send_text(
-                        f"TRANSFER INCOMPLETE MISSING {missing_text}"
+                        f"TRANSFER INCOMPLETE " f"MISSING {missing_text}"
                     )
                     continue
 
@@ -321,22 +343,23 @@ async def ws_endpoint(ws: WebSocket) -> None:
                     for sequence in range(transfer.total_chunks)
                 )
 
-                actual_sha256 = hashlib.sha256(
-                    reconstructed.encode("utf-8")
-                ).hexdigest()
+                reconstructed_bytes = reconstructed.encode("utf-8")
+
+                actual_sha256 = hashlib.sha256(reconstructed_bytes).hexdigest()
 
                 if actual_sha256 != transfer.expected_sha256:
-                    await ws.send_text(
-                        f"CHECKSUM FAILED {actual_sha256}"
-                    )
+                    await ws.send_text(f"CHECKSUM FAILED {actual_sha256}")
                     continue
 
                 await ws.send_text(
                     f"TRANSFER COMPLETE "
                     f"{transfer.filename} "
-                    f"{len(reconstructed.encode('utf-8'))} bytes "
+                    f"{len(reconstructed_bytes)} bytes "
                     f"{transfer.packet_attempts} attempts "
-                    f"{transfer.duplicate_packets} duplicates"
+                    f"{transfer.dropped_attempts} dropped "
+                    f"{transfer.duplicate_packets} duplicates "
+                    f"{transfer.simulated_wire_bytes} "
+                    f"simulated-wire-bytes"
                 )
 
                 transfer = None
@@ -355,6 +378,7 @@ if __name__ == "__main__":
     import uvicorn
 
     port = int(os.environ.get("PORT", "9000"))
+
     uvicorn.run(
         app,
         host="0.0.0.0",
