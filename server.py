@@ -6,6 +6,8 @@ import os
 import random
 import sys
 from dataclasses import dataclass, field
+from collections import deque
+from typing import Final
 
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.responses import HTMLResponse
@@ -31,9 +33,231 @@ ACK_BYTES = 8
 online_hosts: dict[str, str] = {
     "10.0.0.1:20": "The Bank",
     "10.0.0.7:21": "NY Times",
-    "10.0.0.7:23": "white house",
-    "10.0.0.7:24": "i knew it",
+    "10.0.0.8:23": "white house",
+    "10.0.0.9:24": "i knew it",
 }
+
+COMPUTER_IP: Final[str] = "10.0.2.100"
+LOCAL_ROUTER: Final[str] = "10.0.1.1"
+ROUTER_COUNT: Final[int] = 6
+
+# Leave NETWORK_SEED unset for a new topology after each restart.
+# Set it in Render when you need repeatable behavior.
+random_source = random.Random(os.environ.get("NETWORK_SEED"))
+
+
+def get_host_ips() -> list[str]:
+    return sorted({address.rsplit(":", maxsplit=1)[0] for address in online_hosts})
+
+
+def first_router_hop(
+    start: str,
+    destination: str,
+    adjacency: dict[str, list[str]],
+) -> str | None:
+    if start == destination:
+        return destination
+
+    queue: deque[tuple[str, str]] = deque()
+    visited: set[str] = {start}
+
+    for neighbor in adjacency[start]:
+        queue.append((neighbor, neighbor))
+        visited.add(neighbor)
+
+    while queue:
+        current, first_hop = queue.popleft()
+
+        if current == destination:
+            return first_hop
+
+        for neighbor in adjacency[current]:
+            if neighbor in visited:
+                continue
+
+            visited.add(neighbor)
+            queue.append((neighbor, first_hop))
+
+    return None
+
+
+def build_network(
+    host_ips: list[str],
+    router_count: int,
+) -> tuple[
+    dict[str, list[str]],
+    dict[str, str],
+    dict[str, dict[str, str]],
+]:
+    routers = [f"10.0.1.{number}" for number in range(1, router_count + 1)]
+
+    adjacency: dict[str, list[str]] = {router: [] for router in routers}
+
+    # Each new router attaches to one existing router.
+    # This creates a connected tree with no routing loops.
+    for index in range(1, len(routers)):
+        router = routers[index]
+        parent = random_source.choice(routers[:index])
+
+        adjacency[parent].append(router)
+        adjacency[router].append(parent)
+
+    # Avoid attaching hosts directly to the student's local router
+    # so traceroute normally contains multiple hops.
+    possible_host_routers = routers[1:] if len(routers) > 1 else routers
+
+    host_attachment: dict[str, str] = {}
+
+    for host_ip in host_ips:
+        host_attachment[host_ip] = random_source.choice(possible_host_routers)
+
+    routing_tables: dict[str, dict[str, str]] = {router: {} for router in routers}
+
+    for router in routers:
+        for host_ip, attached_router in host_attachment.items():
+            if router == attached_router:
+                # The host is directly connected to this router.
+                routing_tables[router][host_ip] = host_ip
+                continue
+
+            next_hop = first_router_hop(
+                router,
+                attached_router,
+                adjacency,
+            )
+
+            if next_hop is None:
+                raise RuntimeError(f"No route from {router} to {attached_router}")
+
+            routing_tables[router][host_ip] = next_hop
+
+    return adjacency, host_attachment, routing_tables
+
+
+def build_reverse_routes(
+    router_count: int,
+) -> tuple[
+    dict[str, list[str]],
+    dict[str, str],
+]:
+    routers = [f"10.0.1.{number}" for number in range(1, router_count + 1)]
+
+    adjacency: dict[str, list[str]] = {router: [] for router in routers}
+
+    # Generate a second independent router tree.
+    for index in range(1, len(routers)):
+        router = routers[index]
+        parent = random_source.choice(routers[:index])
+
+        adjacency[parent].append(router)
+        adjacency[router].append(parent)
+
+    next_hops_to_computer: dict[str, str] = {}
+
+    for router in routers:
+        if router == LOCAL_ROUTER:
+            continue
+
+        next_hop = first_router_hop(
+            router,
+            LOCAL_ROUTER,
+            adjacency,
+        )
+
+        if next_hop is None:
+            raise RuntimeError(f"No reverse route from {router}")
+
+        next_hops_to_computer[router] = next_hop
+
+    return adjacency, next_hops_to_computer
+
+
+router_links, host_attachment, routing_tables = build_network(
+    get_host_ips(),
+    ROUTER_COUNT,
+)
+reverse_router_links, reverse_next_hops = build_reverse_routes(ROUTER_COUNT)
+computer_routing_table = {
+    "default": LOCAL_ROUTER,
+}
+
+
+def trace_packet(
+    destination_ip: str,
+    ttl: int,
+) -> str:
+    if ttl < 1:
+        return "TTL must be at least 1."
+
+    if destination_ip not in host_attachment:
+        return f"DESTINATION UNREACHABLE {destination_ip}"
+
+    # The virtual computer sends everything to its default gateway.
+    current_router = computer_routing_table["default"]
+    remaining_ttl = ttl
+    visited: set[str] = set()
+
+    while True:
+        if current_router in visited:
+            return f"ROUTING LOOP AT {current_router}"
+
+        visited.add(current_router)
+
+        # Every router decreases the TTL before forwarding.
+        remaining_ttl -= 1
+
+        if remaining_ttl == 0:
+            return f"TTL EXPIRED AT {current_router}"
+
+        next_hop = routing_tables[current_router].get(destination_ip)
+
+        if next_hop is None:
+            return f"NO ROUTE FROM {current_router}"
+
+        if next_hop == destination_ip:
+            return f"REACHED {destination_ip}"
+
+        current_router = next_hop
+
+
+def trace_from_host_to_computer(
+    source_ip: str,
+    ttl: int,
+) -> str:
+    if ttl < 1:
+        return "TTL must be at least 1."
+
+    attached_router = host_attachment.get(source_ip)
+
+    if attached_router is None:
+        return f"UNKNOWN HOST {source_ip}"
+
+    current_router = attached_router
+    remaining_ttl = ttl
+    visited: set[str] = set()
+
+    while True:
+        if current_router in visited:
+            return f"ROUTING LOOP AT {current_router}"
+
+        visited.add(current_router)
+
+        # The current router processes and decreases the TTL.
+        remaining_ttl -= 1
+
+        if remaining_ttl == 0:
+            return f"TTL EXPIRED AT {current_router}"
+
+        # The local router forwards directly to the computer.
+        if current_router == LOCAL_ROUTER:
+            return f"REACHED {COMPUTER_IP}"
+
+        next_hop = reverse_next_hops.get(current_router)
+
+        if next_hop is None:
+            return f"NO ROUTE FROM {current_router}"
+
+        current_router = next_hop
 
 
 @dataclass
@@ -52,11 +276,13 @@ class Transfer:
 @app.get("/")
 async def health() -> dict[str, object]:
     return {
-        "version": 3.0,
+        "version": 4.0,
         "secret_count": 4,
         "python_version": sys.version,
         "virtual_frame_bytes": VIRTUAL_FRAME_BYTES,
         "frame_loss_rate": FRAME_LOSS_RATE,
+        "router_count": ROUTER_COUNT,
+        "own_ip": COMPUTER_IP
     }
 
 
@@ -75,6 +301,8 @@ async def send_help(ws: WebSocket) -> None:
         "DATA <sequence_number> <text>\n"
         "STATUS\n"
         "DONE\n"
+        "TRACE <ip> <ttl>\n"
+        "REMOTE_TRACE <ttl> \n"
         "HELP".splitlines()
     ):
         await ws.send_text(line)
@@ -96,6 +324,7 @@ async def ws_endpoint(ws: WebSocket) -> None:
                 continue
 
             command = message.split(maxsplit=1)[0].upper()
+            _, *args = message.split()
 
             if command == "CONNECT":
                 parts = message.split()
@@ -366,7 +595,43 @@ async def ws_endpoint(ws: WebSocket) -> None:
 
             elif command == "HELP":
                 await send_help(ws)
+            elif command == "TRACE":
+                if len(args) != 2:
+                    await ws.send_text("Usage: TRACE <destination-ip> <ttl>")
+                    continue
 
+                destination_ip = args[0]
+
+                try:
+                    ttl = int(args[1])
+                except ValueError:
+                    await ws.send_text("TTL must be an integer.")
+                    continue
+
+                await ws.send_text(trace_packet(destination_ip, ttl))
+            elif command == "REMOTE_TRACE":
+                if connection is None:
+                    await ws.send_text("You must connect to a host first.")
+                    continue
+
+                if len(args) != 1:
+                    await ws.send_text("Usage: REMOTE_TRACE <ttl>")
+                    continue
+
+                try:
+                    ttl = int(args[0])
+                except ValueError:
+                    await ws.send_text("TTL must be an integer.")
+                    continue
+
+                source_ip = connection.rsplit(":", maxsplit=1)[0]
+
+                await ws.send_text(
+                    trace_from_host_to_computer(
+                        source_ip,
+                        ttl,
+                    )
+                )
             else:
                 await send_help(ws)
 
